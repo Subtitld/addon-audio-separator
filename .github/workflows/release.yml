@@ -1,0 +1,214 @@
+name: Release
+
+# Cuts the platform zips for the audio-separator add-on, attaches them
+# to a GitHub Release, and pings the catalog repo.
+#
+# Build is dominated by torch + onnxruntime + librosa. We pin to CPU
+# wheels — users with CUDA hardware can still flip the `device` config
+# field at runtime; the addon will auto-detect a CUDAExecutionProvider
+# if one happens to be installed in the freeze, but we don't bundle one
+# (the size delta is ~2 GB).
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)release (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform_suffix: linux-x86_64
+          - os: macos-latest
+            platform_suffix: macos-universal
+          - os: windows-latest
+            platform_suffix: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          MANIFEST_VERSION=$(python -c "import json; print(json.load(open('manifest.json'))['version'])")
+          if [ "$VERSION" != "$MANIFEST_VERSION" ]; then
+            echo "::error::tag $TAG implies version $VERSION but manifest.json declares $MANIFEST_VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install build deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          # CPU-only torch — keeps the freeze size in check. Users on
+          # CUDA hardware install via the catalog as-is and the addon
+          # falls back to CPU; a future addon variant can ship the
+          # CUDA wheels.
+          pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
+          # python-audio-separator on PyPI; pulls onnxruntime, librosa,
+          # samplerate, pydub, demucs, etc. Pin a known-good range so
+          # CI stays reproducible — bump intentionally.
+          pip install "audio-separator[cpu]>=0.17,<1.0"
+          # platformdirs for the per-user model cache. Unlike kokoro we
+          # don't depend on the full HF-hub stack, so this is the only
+          # extra pin needed.
+          pip install platformdirs
+
+      - name: Build add-on bundle
+        run: pyinstaller audio-separator-addon.spec --distpath dist/
+
+      - name: Smoke test frozen binary (hello frame)
+        shell: bash
+        run: |
+          set -e
+          BIN_DIR="dist/audio-separator-addon"
+          BIN_NAME="audio-separator-addon"
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN_NAME="${BIN_NAME}.exe"; fi
+          BIN="$BIN_DIR/$BIN_NAME"
+          # Drive the binary from Python rather than the shell pipeline:
+          # macOS runners don't have GNU `timeout` on PATH, and Python's
+          # threading.Timer watchdog is portable across all three OS
+          # runners. The wrapper writes its hello frame immediately on
+          # startup; one line + EOF on stdin makes it exit cleanly.
+          python - "$BIN" <<'PY'
+          import json, subprocess, sys, threading
+          proc = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True)
+          def watchdog():
+              try: proc.kill()
+              except Exception: pass
+          timer = threading.Timer(60.0, watchdog); timer.start()
+          try:
+              proc.stdin.close()
+              line = proc.stdout.readline()
+          finally:
+              timer.cancel()
+              try: proc.terminate()
+              except Exception: pass
+              try: proc.wait(timeout=10)
+              except Exception:
+                  try: proc.kill()
+                  except Exception: pass
+          print('frame:', (line or '').strip())
+          if not line:
+              sys.exit('no hello frame received within 60 s')
+          frame = json.loads(line)
+          assert frame.get('type') == 'hello', frame
+          assert frame.get('addon') == 'audio-separator', frame
+          caps = frame.get('capabilities') or []
+          assert any(c.get('task') == 'audio.separate' for c in caps), caps
+          PY
+
+      - name: Pack zip
+        id: pack
+        shell: bash
+        run: |
+          set -e
+          VERSION="${{ steps.ver.outputs.version }}"
+          PLAT="${{ matrix.platform_suffix }}"
+          ZIP_NAME="audio-separator-${VERSION}-${PLAT}.zip"
+          STAGE="$RUNNER_TEMP/stage"
+          mkdir -p "$STAGE/bin"
+          cp -r dist/audio-separator-addon/* "$STAGE/bin/"
+          cp manifest.json LICENSE README.md "$STAGE/"
+          # Use Python's shutil.make_archive — Windows runner's Git Bash
+          # doesn't ship `zip`. Python is on PATH via setup-python@v5.
+          python - "$STAGE" "$GITHUB_WORKSPACE/${ZIP_NAME%.zip}" <<'PY'
+          import shutil, sys
+          shutil.make_archive(sys.argv[2], 'zip', sys.argv[1])
+          PY
+          echo "zip_path=$GITHUB_WORKSPACE/$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Compute sha256 sidecar
+        shell: bash
+        run: |
+          ZIP="${{ steps.pack.outputs.zip_path }}"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$(basename "$ZIP")" > "${ZIP}.sha256"
+          else
+            shasum -a 256 "$(basename "$ZIP")" > "${ZIP}.sha256"
+          fi
+          cat "${ZIP}.sha256"
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zip-${{ matrix.platform_suffix }}
+          path: |
+            ${{ steps.pack.outputs.zip_path }}
+            ${{ steps.pack.outputs.zip_path }}.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Resolve tag
+        id: tagref
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -e
+          TAG="${{ steps.tagref.outputs.tag }}"
+          mapfile -t ASSETS < <(find artifacts -type f \( -name '*.zip' -o -name '*.sha256' \))
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "Automated release for audio-separator $TAG." \
+              "${ASSETS[@]}"
+          fi
+
+      - name: Trigger Subtitld catalog rebuild
+        env:
+          GH_TOKEN: ${{ secrets.SUBTITLD_BOT_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::SUBTITLD_BOT_TOKEN not set — catalog rebuild skipped (cron will pick this up within 6 h)"
+            exit 0
+          fi
+          gh api repos/Subtitld/addons-catalog/dispatches \
+            -f event_type=catalog-rebuild \
+            -F client_payload[addon]=audio-separator \
+            -F client_payload[tag]="${{ steps.tagref.outputs.tag }}"

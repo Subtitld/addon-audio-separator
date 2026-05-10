@@ -1,0 +1,61 @@
+{
+  "manifest_version": 1,
+  "id": "audio-separator",
+  "version": "1.0.0",
+  "display_name": "audio-separator (UVR / MDX / Demucs)",
+  "summary": "High-quality vocal/music separation using UVR, MDX-Net, and Demucs models. Quality > the built-in ffmpeg mid/side trick at the cost of a one-shot model download (~50–500 MB) and a few seconds of inference per minute.",
+  "author": "Subtitld add-on team",
+  "license": "MIT (wrapper) + MIT (python-audio-separator) + per-model (see model card)",
+  "executable": "bin/audio-separator-addon",
+  "protocol": 1,
+  "startup_timeout_sec": 60,
+  "platforms": ["linux", "macos", "windows"],
+  "tasks": ["audio.separate"],
+  "models": [
+    {"id": "UVR-MDX-NET-Inst_HQ_3.onnx", "size_mb": 64, "bundled": false},
+    {"id": "UVR_MDXNET_KARA_2.onnx",     "size_mb": 64, "bundled": false},
+    {"id": "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "size_mb": 396, "bundled": false},
+    {"id": "htdemucs_ft.yaml",           "size_mb": 320, "bundled": false}
+  ],
+  "disk_required_mb": 1024,
+  "ram_required_mb": 4096,
+  "gpu": "optional",
+  "config_schema": {
+    "fields": [
+      {
+        "key": "model_filename",
+        "type": "select",
+        "label": "Separation model",
+        "default": "UVR-MDX-NET-Inst_HQ_3.onnx",
+        "options": [
+          {"value": "UVR-MDX-NET-Inst_HQ_3.onnx",                "label": "UVR-MDX-NET Inst HQ 3 — fast, balanced (~64 MB)"},
+          {"value": "UVR_MDXNET_KARA_2.onnx",                    "label": "UVR-MDX-NET Karaoke 2 — main vs. backing vocals (~64 MB)"},
+          {"value": "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "label": "BS-Roformer 12.97 SDR — top quality, slow (~396 MB)"},
+          {"value": "htdemucs_ft.yaml",                          "label": "Demucs HT-Demucs ft — vocals/drums/bass/other 4-stem (~320 MB)"}
+        ]
+      },
+      {
+        "key": "device",
+        "type": "select",
+        "label": "Inference device",
+        "default": "cpu",
+        "options": [
+          {"value": "cpu",  "label": "CPU (works everywhere; slow on big models)"},
+          {"value": "cuda", "label": "CUDA (NVIDIA GPU, fastest)"},
+          {"value": "mps",  "label": "MPS (Apple Silicon)"}
+        ]
+      },
+      {
+        "key": "output_format",
+        "type": "select",
+        "label": "Output format",
+        "default": "FLAC",
+        "options": [
+          {"value": "FLAC", "label": "FLAC (lossless, default — matches built-in)"},
+          {"value": "WAV",  "label": "WAV (uncompressed PCM)"},
+          {"value": "MP3",  "label": "MP3 (smaller, lossy)"}
+        ]
+      }
+    ]
+  }
+}
