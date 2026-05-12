@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "id": "audio-separator",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "display_name": "audio-separator (UVR / MDX / Demucs)",
   "summary": "High-quality vocal/music separation using UVR, MDX-Net, and Demucs models. Quality > the built-in ffmpeg mid/side trick at the cost of a one-shot model download (~50–500 MB) and a few seconds of inference per minute.",
   "author": "Subtitld add-on team",
@@ -12,6 +12,7 @@
   "platforms": ["linux", "macos", "windows"],
   "tasks": ["audio.separate"],
   "models": [
+    {"id": "Kim_Inst.onnx",              "size_mb": 67, "bundled": false},
     {"id": "UVR-MDX-NET-Inst_HQ_3.onnx", "size_mb": 64, "bundled": false},
     {"id": "UVR_MDXNET_KARA_2.onnx",     "size_mb": 64, "bundled": false},
     {"id": "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "size_mb": 396, "bundled": false},
@@ -26,8 +27,9 @@
         "key": "model_filename",
         "type": "select",
         "label": "Separation model",
-        "default": "UVR-MDX-NET-Inst_HQ_3.onnx",
+        "default": "Kim_Inst.onnx",
         "options": [
+          {"value": "Kim_Inst.onnx",                             "label": "Kim Inst (MDX) — vocals vs. instrumental, recommended default (~67 MB)"},
           {"value": "UVR-MDX-NET-Inst_HQ_3.onnx",                "label": "UVR-MDX-NET Inst HQ 3 — fast, balanced (~64 MB)"},
           {"value": "UVR_MDXNET_KARA_2.onnx",                    "label": "UVR-MDX-NET Karaoke 2 — main vs. backing vocals (~64 MB)"},
           {"value": "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "label": "BS-Roformer 12.97 SDR — top quality, slow (~396 MB)"},

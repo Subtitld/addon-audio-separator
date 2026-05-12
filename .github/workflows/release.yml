@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)release (e.g. v0.0.1)"
+        description: "Existing tag to (re)release (e.g. v0.0.2)"
         required: true
 
 permissions:
@@ -63,19 +63,44 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
-          # CPU-only torch — keeps the freeze size in check. Users on
-          # CUDA hardware install via the catalog as-is and the addon
-          # falls back to CPU; a future addon variant can ship the
-          # CUDA wheels.
-          pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
           # python-audio-separator on PyPI; pulls onnxruntime, librosa,
-          # samplerate, pydub, demucs, etc. Pin a known-good range so
-          # CI stays reproducible — bump intentionally.
+          # samplerate, pydub, demucs, torch, torchvision, etc. Pinned
+          # range for reproducibility — bump intentionally.
           pip install "audio-separator[cpu]>=0.17,<1.0"
           # platformdirs for the per-user model cache. Unlike kokoro we
           # don't depend on the full HF-hub stack, so this is the only
           # extra pin needed.
           pip install platformdirs
+
+          # ----------------------------------------------------------------
+          # Linux-only: kill the CUDA bloat.
+          # ----------------------------------------------------------------
+          # On Linux, `audio-separator[cpu]` transitively requires
+          # `torchvision`, and pip's resolver decided the +cpu local-version
+          # tag was "older" than the PyPI default — silently swapping
+          # `torch-2.x.y+cpu` (~190 MB) for `torch-2.x.y` (530 MB CUDA build)
+          # plus ~2.7 GB of `nvidia-*` wheels (cublas, cudnn, cufft, nccl,
+          # cusolver, cusparse, triton, …). That pushed the frozen Linux
+          # bundle past 3.7 GB — over GitHub's 2 GiB per-asset upload limit.
+          #
+          # macOS/Windows torch wheels on PyPI are already CPU-only (no
+          # Linux-style CUDA dispatch wheels exist for those platforms),
+          # so the cleanup is gated to Linux.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "::group::Force-reinstall CPU-only torch + torchvision"
+            pip install --force-reinstall --no-deps \
+              torch torchvision \
+              --index-url https://download.pytorch.org/whl/cpu
+            echo "::endgroup::"
+            echo "::group::Uninstall orphaned CUDA wheels"
+            # `pip list | awk` rather than a hardcoded package list — the
+            # exact set of nvidia-* deps shifts release-to-release and
+            # missing names would cause a noisy `pip uninstall` failure.
+            pip list --format=freeze \
+              | awk -F= '/^(nvidia-|triton==|cuda-bindings==)/{print $1}' \
+              | xargs -r pip uninstall -y
+            echo "::endgroup::"
+          fi
 
       - name: Build add-on bundle
         run: pyinstaller audio-separator-addon.spec --distpath dist/

@@ -34,7 +34,7 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO,
 
 PROTOCOL = 1
 ADDON_ID = 'audio-separator'
-VERSION = '0.0.1'
+VERSION = '0.0.2'
 
 
 # ---------------------------------------------------------------------------

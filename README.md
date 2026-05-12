@@ -50,7 +50,7 @@ pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
 pip install "audio-separator[cpu]>=0.17,<1.0" platformdirs
 pyinstaller audio-separator-addon.spec --distpath dist/
 cd dist/audio-separator-addon
-zip -r ../audio-separator-0.0.1-linux-x86_64.zip . ../../manifest.json ../../LICENSE ../../README.md
+zip -r ../audio-separator-0.0.2-linux-x86_64.zip . ../../manifest.json ../../LICENSE ../../README.md
 ```
 
 ## Output contract
