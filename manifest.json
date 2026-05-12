@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "id": "audio-separator",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "display_name": "audio-separator (UVR / MDX / Demucs)",
   "summary": "High-quality vocal/music separation using UVR, MDX-Net, and Demucs models. Quality > the built-in ffmpeg mid/side trick at the cost of a one-shot model download (~50–500 MB) and a few seconds of inference per minute.",
   "author": "Subtitld add-on team",
