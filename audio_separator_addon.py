@@ -34,7 +34,17 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO,
 
 PROTOCOL = 1
 ADDON_ID = 'audio-separator'
-VERSION = '0.0.3'
+VERSION = '0.0.4'
+
+# Host (`audioengine.py`) hard-requires 48 kHz mono audio: any cached
+# stem that round-trips through it must match or it raises
+# `ValueError: Sample rate mismatch`. The built-in `ffmpeg-separator`
+# already writes 48 kHz mono — mirror its contract here so add-on
+# outputs are drop-in compatible. MDX/UVR models natively emit
+# 44.1 kHz stereo; Demucs emits 44.1 kHz stereo too. We post-process
+# every stem before handing it back to the host.
+_HOST_SAMPLE_RATE = 48000
+_HOST_CHANNELS = 1
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +242,12 @@ def _mix_to_single_track(stems: list[str], output_path: str,
     """Demucs gives us 3 instrumental stems (drums, bass, other). The host
     contract is one `background` file — mix them together with ffmpeg's
     `amix` filter. The result lives next to the source stems so the
-    addon stays self-contained."""
+    addon stays self-contained.
+
+    We fold the host's 48 kHz mono normalization into the same ffmpeg
+    invocation (rather than running a separate resample pass) so the
+    Demucs path is a single decode/encode cycle.
+    """
     import subprocess
 
     cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y']
@@ -242,6 +257,8 @@ def _mix_to_single_track(stems: list[str], output_path: str,
     cmd += [
         '-filter_complex',
         f'amix=inputs={len(stems)}:normalize=0',
+        '-ar', str(_HOST_SAMPLE_RATE),
+        '-ac', str(_HOST_CHANNELS),
         output_path,
     ]
     rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -250,6 +267,50 @@ def _mix_to_single_track(stems: list[str], output_path: str,
             f'ffmpeg amix failed: '
             f'{rc.stderr.decode("utf-8", "replace")[:200]}')
     return output_path
+
+
+def _normalize_to_host_format(path: str) -> str:
+    """Resample/downmix a stem in-place to 48 kHz mono.
+
+    The host's `audioengine.load_audio` (see Subtitld
+    `src/subtitld/modules/audioengine.py`) raises
+    `ValueError: Sample rate mismatch` if the file isn't 48 kHz.
+    `python-audio-separator` writes at the model's training rate
+    (44.1 kHz for MDX/UVR/Roformer, 44.1 kHz stereo for Demucs).
+    Cheaper than a probe + branch: unconditionally re-encode each
+    stem to 48 kHz mono. ffmpeg's resampler short-circuits when the
+    rate already matches, so this is a near-noop on the rare model
+    that already produces 48 kHz.
+
+    We write to a sibling temp file and rename atomically so a
+    crashed ffmpeg never leaves a half-written stem in the cache
+    (where it'd survive across runs and break the next playback).
+    """
+    import subprocess
+
+    root, ext = os.path.splitext(path)
+    temp_path = f'{root}._normalize{ext}'
+    cmd = [
+        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+        '-i', path,
+        '-ar', str(_HOST_SAMPLE_RATE),
+        '-ac', str(_HOST_CHANNELS),
+        temp_path,
+    ]
+    rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if rc.returncode != 0:
+        # Best-effort cleanup of the partial temp before surfacing the
+        # error — leaving stray `._normalize.flac` files in the cache
+        # would confuse future cache-hit checks.
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f'ffmpeg resample failed for {os.path.basename(path)!r}: '
+            f'{rc.stderr.decode("utf-8", "replace")[:200]}')
+    os.replace(temp_path, path)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -341,11 +402,22 @@ def handle_audio_separate(rid: str, params: dict, defaults: dict) -> None:
 
     if len(background_paths) == 1:
         background_path = background_paths[0]
+        # 2-stem path: separator wrote a stem directly to disk at the
+        # model's native rate (44.1 kHz stereo for MDX/UVR/Roformer).
+        # Resample/downmix to the host's 48 kHz mono in place.
+        try:
+            _normalize_to_host_format(background_path)
+        except Exception as exc:
+            log.exception('background normalize failed')
+            emit_error(rid, 'internal',
+                       f'failed to normalize background to 48 kHz mono: {exc}')
+            return
     else:
         # 4-stem Demucs case — mix drums/bass/other into one file. We pick
         # the model name suffix from one of them so the merged file stays
         # next to its source stems (and gets cleaned up alongside them when
-        # the cache rolls over).
+        # the cache rolls over). `_mix_to_single_track` already emits at
+        # 48 kHz mono, no separate normalize pass needed here.
         merged_name = (Path(background_paths[0]).stem.split('_(')[0]
                        + '_(Background)_'
                        + os.path.splitext(model_filename)[0]
@@ -358,6 +430,17 @@ def handle_audio_separate(rid: str, params: dict, defaults: dict) -> None:
             emit_error(rid, 'internal',
                        f'failed to mix Demucs stems: {exc}')
             return
+
+    # Vocals stem always comes straight off the separator at the model's
+    # native rate — normalize unconditionally so the host's load_audio
+    # contract (48 kHz mono) holds for both stems.
+    try:
+        _normalize_to_host_format(vocals_path)
+    except Exception as exc:
+        log.exception('vocals normalize failed')
+        emit_error(rid, 'internal',
+                   f'failed to normalize vocals to 48 kHz mono: {exc}')
+        return
 
     emit_progress(rid, 1.0, 'Done')
     emit_result(rid, {

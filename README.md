@@ -50,7 +50,7 @@ pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
 pip install "audio-separator[cpu]>=0.17,<1.0" platformdirs
 pyinstaller audio-separator-addon.spec --distpath dist/
 cd dist/audio-separator-addon
-zip -r ../audio-separator-0.0.3-linux-x86_64.zip . ../../manifest.json ../../LICENSE ../../README.md
+zip -r ../audio-separator-0.0.4-linux-x86_64.zip . ../../manifest.json ../../LICENSE ../../README.md
 ```
 
 ## Output contract
@@ -64,6 +64,13 @@ frame:
 
 For 4-stem Demucs the wrapper mixes drums/bass/other together with
 ffmpeg's `amix` filter so callers always see one `background` file.
+
+Both stems are post-normalized to **48 kHz mono** before the result
+frame fires. This matches the built-in `ffmpeg-separator` and the
+host's `audioengine.load_audio`, which raises `Sample rate mismatch`
+on anything else. MDX/UVR/Roformer models natively emit 44.1 kHz
+stereo, so this resample is unconditional — cheap with ffmpeg's
+short-circuit when rates already match.
 
 ## License
 
