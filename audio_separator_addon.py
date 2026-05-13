@@ -34,7 +34,7 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO,
 
 PROTOCOL = 1
 ADDON_ID = 'audio-separator'
-VERSION = '0.0.2'
+VERSION = '0.0.3'
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +173,60 @@ def _classify_stems(paths: list[str]) -> tuple[str | None, list[str], list[str]]
     return vocals, background, leftover
 
 
+# libsndfile (used by python-audio-separator's metadata probe) knows
+# WAV / FLAC / OGG / AIFF / AU / W64 / etc., but throws
+# `Format not recognised` on video containers (MKV / MP4 / WebM / MOV /
+# AVI / …). python-audio-separator still limps along via its own ffmpeg
+# fallback, but the bit-depth probe silently defaults to 16-bit and the
+# logs are noisy. Fix it at the source: any extension we don't recognise
+# as audio, transcode to a temp WAV via ffmpeg up front and hand that
+# to the Separator. ffmpeg is a hard dep already (`_mix_to_single_track`
+# below relies on it too).
+_LIBSNDFILE_FRIENDLY = {
+    '.wav', '.wave', '.flac', '.ogg', '.oga', '.opus', '.aiff', '.aif',
+    '.au', '.snd', '.w64', '.caf', '.mp3', '.m4a',
+}
+
+
+def _prepare_input_audio(input_path: str, work_dir: str) -> tuple[str, str | None]:
+    """Return `(path_to_feed_separator, temp_to_cleanup_or_None)`.
+
+    If the input is already an audio container libsndfile speaks, returns
+    `(input_path, None)`. Otherwise extracts the first audio stream to a
+    temp WAV in `work_dir` and returns `(temp_path, temp_path)` — caller
+    is responsible for unlinking the temp file once the Separator is done.
+    """
+    import subprocess
+    import uuid
+
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext in _LIBSNDFILE_FRIENDLY:
+        return input_path, None
+
+    temp_path = os.path.join(work_dir, f'_input_{uuid.uuid4().hex}.wav')
+    # `-vn` drops video; `-map 0:a:0?` grabs the first audio stream if
+    # present (the `?` makes the mapping optional so we get a clear
+    # ffmpeg error instead of a Python crash when the file has no audio).
+    # pcm_s16le matches what libsndfile would have produced via its
+    # 16-bit default, so no quality regression vs the warning path.
+    cmd = [
+        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+        '-i', input_path,
+        '-vn', '-map', '0:a:0?',
+        '-acodec', 'pcm_s16le',
+        temp_path,
+    ]
+    rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if rc.returncode != 0:
+        raise RuntimeError(
+            f'ffmpeg decode failed: '
+            f'{rc.stderr.decode("utf-8", "replace")[:200]}')
+    if not os.path.isfile(temp_path) or os.path.getsize(temp_path) == 0:
+        raise RuntimeError(
+            f'ffmpeg produced no audio output for {input_path!r}')
+    return temp_path, temp_path
+
+
 def _mix_to_single_track(stems: list[str], output_path: str,
                          output_format: str) -> str:
     """Demucs gives us 3 instrumental stems (drums, bass, other). The host
@@ -233,20 +287,41 @@ def handle_audio_separate(rid: str, params: dict, defaults: dict) -> None:
         emit_error(rid, 'internal', f'failed to load separator: {exc}')
         return
 
-    emit_progress(rid, 0.4, 'Separating audio...')
+    # Pre-decode video containers (mkv / mp4 / etc.) into a temp WAV — the
+    # Separator's metadata probe goes through libsndfile, which only
+    # speaks audio formats. Tracked in `temp_decoded` so the finally below
+    # can clean up regardless of which branch returns/raises after this
+    # point.
+    temp_decoded: str | None = None
     try:
-        # `Separator.separate(...)` is synchronous and returns the list of
-        # output filenames it just wrote. Some versions return basenames
-        # relative to `output_dir`; normalize.
-        raw = sep.separate(input_path)
-        outputs = [
-            p if os.path.isabs(p) else os.path.join(output_dir, p)
-            for p in (raw or [])
-        ]
-    except Exception as exc:
-        log.exception('separation failed')
-        emit_error(rid, 'internal', f'separation failed: {exc}')
-        return
+        emit_progress(rid, 0.2, 'Preparing input audio...')
+        try:
+            feed_path, temp_decoded = _prepare_input_audio(input_path, output_dir)
+        except Exception as exc:
+            log.exception('input decode failed')
+            emit_error(rid, 'internal', f'failed to decode input: {exc}')
+            return
+
+        emit_progress(rid, 0.4, 'Separating audio...')
+        try:
+            # `Separator.separate(...)` is synchronous and returns the list of
+            # output filenames it just wrote. Some versions return basenames
+            # relative to `output_dir`; normalize.
+            raw = sep.separate(feed_path)
+            outputs = [
+                p if os.path.isabs(p) else os.path.join(output_dir, p)
+                for p in (raw or [])
+            ]
+        except Exception as exc:
+            log.exception('separation failed')
+            emit_error(rid, 'internal', f'separation failed: {exc}')
+            return
+    finally:
+        if temp_decoded is not None:
+            try:
+                os.remove(temp_decoded)
+            except OSError:
+                pass
 
     if not outputs:
         emit_error(rid, 'internal', 'separator returned no output files')
@@ -311,7 +386,7 @@ def main() -> int:
     defaults = {
         'model_filename': (os.environ.get('AUDIO_SEPARATOR_MODEL')
                            or config_defaults.get('model_filename',
-                                                  'UVR-MDX-NET-Inst_HQ_3.onnx')),
+                                                  'Kim_Inst.onnx')),
         'device': (os.environ.get('AUDIO_SEPARATOR_DEVICE')
                    or config_defaults.get('device', 'cpu')),
         'output_format': (os.environ.get('AUDIO_SEPARATOR_OUTPUT_FORMAT')
