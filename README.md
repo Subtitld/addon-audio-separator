@@ -65,12 +65,21 @@ frame:
 For 4-stem Demucs the wrapper mixes drums/bass/other together with
 ffmpeg's `amix` filter so callers always see one `background` file.
 
-Both stems are post-normalized to **48 kHz mono** before the result
-frame fires. This matches the built-in `ffmpeg-separator` and the
-host's `audioengine.load_audio`, which raises `Sample rate mismatch`
-on anything else. MDX/UVR/Roformer models natively emit 44.1 kHz
-stereo, so this resample is unconditional — cheap with ffmpeg's
-short-circuit when rates already match.
+Both stems are post-normalized to **48 kHz** before the result frame
+fires (the host's `audioengine.load_audio` raises `Sample rate mismatch`
+on anything else). Channel layout is split by stem:
+
+- **background**: stereo. MDX/UVR/Demucs models natively emit 44.1 kHz
+  stereo and the spatial information (drum spread, instrument panning,
+  ambience) is musically meaningful. The host's stem playback path
+  (`Clip` and the bounce mixer) is already stereo-aware.
+- **vocals**: mono. Speech is functionally mono and the dubbing
+  pipeline's clone-reference extraction expects a single-channel
+  signal.
+
+MDX/UVR/Roformer models natively emit 44.1 kHz, so the resample is
+unconditional — cheap with ffmpeg's short-circuit when rates already
+match.
 
 ## License
 

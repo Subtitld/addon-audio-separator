@@ -34,17 +34,29 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO,
 
 PROTOCOL = 1
 ADDON_ID = 'audio-separator'
-VERSION = '0.0.4'
+VERSION = '0.0.5'
 
-# Host (`audioengine.py`) hard-requires 48 kHz mono audio: any cached
-# stem that round-trips through it must match or it raises
-# `ValueError: Sample rate mismatch`. The built-in `ffmpeg-separator`
-# already writes 48 kHz mono — mirror its contract here so add-on
-# outputs are drop-in compatible. MDX/UVR models natively emit
-# 44.1 kHz stereo; Demucs emits 44.1 kHz stereo too. We post-process
-# every stem before handing it back to the host.
+# Host (`audioengine.py`) hard-requires 48 kHz audio: any cached stem
+# that round-trips through it must match or it raises
+# `ValueError: Sample rate mismatch`. The check is *sample-rate only* —
+# channel count is handled downstream (the bounce path tiles mono → stereo
+# transparently in `_load_audio`, and `Clip` reads `always_2d=True`).
+#
+# Channels — per-stem, deliberately split:
+#   * BACKGROUND: stereo. MDX/UVR/Demucs models natively emit 44.1 kHz
+#     stereo and the L/R spatial information is musically meaningful
+#     (drum spread, string sections, ambience). Earlier versions forced
+#     `-ac 1` which threw it away; the host has always been stereo-capable
+#     for stems (only `SubtitleDubClip`, the per-subtitle TTS dub cache,
+#     is mono-by-design, and stems don't route through it).
+#   * VOCALS: mono. Speech content is functionally mono — there's no
+#     spatial information to preserve, and the dubbing pipeline's clone-
+#     reference extraction expects a mono signal anyway.
+#
+# Sample rate is unconditionally 48 kHz because that's the hard contract.
 _HOST_SAMPLE_RATE = 48000
-_HOST_CHANNELS = 1
+_BACKGROUND_CHANNELS = 2
+_VOCALS_CHANNELS = 1
 
 
 # ---------------------------------------------------------------------------
@@ -238,15 +250,19 @@ def _prepare_input_audio(input_path: str, work_dir: str) -> tuple[str, str | Non
 
 
 def _mix_to_single_track(stems: list[str], output_path: str,
-                         output_format: str) -> str:
+                         output_format: str,
+                         channels: int = _BACKGROUND_CHANNELS) -> str:
     """Demucs gives us 3 instrumental stems (drums, bass, other). The host
     contract is one `background` file — mix them together with ffmpeg's
     `amix` filter. The result lives next to the source stems so the
     addon stays self-contained.
 
-    We fold the host's 48 kHz mono normalization into the same ffmpeg
+    We fold the host's 48 kHz channel normalization into the same ffmpeg
     invocation (rather than running a separate resample pass) so the
-    Demucs path is a single decode/encode cycle.
+    Demucs path is a single decode/encode cycle. `channels` defaults to
+    `_BACKGROUND_CHANNELS` (stereo) because this helper is only called on
+    the instrumental side; expose the parameter anyway so the call site
+    stays self-documenting.
     """
     import subprocess
 
@@ -258,7 +274,7 @@ def _mix_to_single_track(stems: list[str], output_path: str,
         '-filter_complex',
         f'amix=inputs={len(stems)}:normalize=0',
         '-ar', str(_HOST_SAMPLE_RATE),
-        '-ac', str(_HOST_CHANNELS),
+        '-ac', str(channels),
         output_path,
     ]
     rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -269,8 +285,9 @@ def _mix_to_single_track(stems: list[str], output_path: str,
     return output_path
 
 
-def _normalize_to_host_format(path: str) -> str:
-    """Resample/downmix a stem in-place to 48 kHz mono.
+def _normalize_to_host_format(path: str, channels: int) -> str:
+    """Resample (and optionally downmix) a stem in-place to 48 kHz, with
+    `channels` output channels.
 
     The host's `audioengine.load_audio` (see Subtitld
     `src/subtitld/modules/audioengine.py`) raises
@@ -278,9 +295,17 @@ def _normalize_to_host_format(path: str) -> str:
     `python-audio-separator` writes at the model's training rate
     (44.1 kHz for MDX/UVR/Roformer, 44.1 kHz stereo for Demucs).
     Cheaper than a probe + branch: unconditionally re-encode each
-    stem to 48 kHz mono. ffmpeg's resampler short-circuits when the
-    rate already matches, so this is a near-noop on the rare model
-    that already produces 48 kHz.
+    stem to 48 kHz at the requested channel layout. ffmpeg's resampler
+    and channel-mixer both short-circuit when the input already matches,
+    so this is a near-noop on the rare model that already produces
+    48 kHz at the target channel count.
+
+    `channels` is required (no default) so callers can't accidentally
+    fall back to whatever the previous convention was — the choice of
+    mono vs stereo is per-stem semantics, not a global default. Pass
+    `_BACKGROUND_CHANNELS` for the instrumental mix (preserve stereo
+    spatial info) and `_VOCALS_CHANNELS` for the speech stem (mono is
+    correct for downstream clone-reference extraction).
 
     We write to a sibling temp file and rename atomically so a
     crashed ffmpeg never leaves a half-written stem in the cache
@@ -294,7 +319,7 @@ def _normalize_to_host_format(path: str) -> str:
         'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
         '-i', path,
         '-ar', str(_HOST_SAMPLE_RATE),
-        '-ac', str(_HOST_CHANNELS),
+        '-ac', str(channels),
         temp_path,
     ]
     rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -404,27 +429,31 @@ def handle_audio_separate(rid: str, params: dict, defaults: dict) -> None:
         background_path = background_paths[0]
         # 2-stem path: separator wrote a stem directly to disk at the
         # model's native rate (44.1 kHz stereo for MDX/UVR/Roformer).
-        # Resample/downmix to the host's 48 kHz mono in place.
+        # Resample to 48 kHz, keep stereo — the spatial info is meaningful
+        # for music/ambience and the host's stem playback path is already
+        # stereo-aware (`Clip` / `bounce._load_audio`).
         try:
-            _normalize_to_host_format(background_path)
+            _normalize_to_host_format(background_path, _BACKGROUND_CHANNELS)
         except Exception as exc:
             log.exception('background normalize failed')
             emit_error(rid, 'internal',
-                       f'failed to normalize background to 48 kHz mono: {exc}')
+                       f'failed to normalize background to 48 kHz stereo: {exc}')
             return
     else:
         # 4-stem Demucs case — mix drums/bass/other into one file. We pick
         # the model name suffix from one of them so the merged file stays
         # next to its source stems (and gets cleaned up alongside them when
-        # the cache rolls over). `_mix_to_single_track` already emits at
-        # 48 kHz mono, no separate normalize pass needed here.
+        # the cache rolls over). `_mix_to_single_track` defaults to stereo
+        # output, which is correct for a music mix; no separate normalize
+        # pass needed here.
         merged_name = (Path(background_paths[0]).stem.split('_(')[0]
                        + '_(Background)_'
                        + os.path.splitext(model_filename)[0]
                        + '.' + output_format.lower())
         background_path = os.path.join(output_dir, merged_name)
         try:
-            _mix_to_single_track(background_paths, background_path, output_format)
+            _mix_to_single_track(background_paths, background_path,
+                                 output_format, channels=_BACKGROUND_CHANNELS)
         except Exception as exc:
             log.exception('background mix failed')
             emit_error(rid, 'internal',
@@ -432,10 +461,11 @@ def handle_audio_separate(rid: str, params: dict, defaults: dict) -> None:
             return
 
     # Vocals stem always comes straight off the separator at the model's
-    # native rate — normalize unconditionally so the host's load_audio
-    # contract (48 kHz mono) holds for both stems.
+    # native rate — normalize to 48 kHz mono. Speech is functionally mono
+    # and the clone-reference extraction in the dubbing path expects a
+    # single-channel signal.
     try:
-        _normalize_to_host_format(vocals_path)
+        _normalize_to_host_format(vocals_path, _VOCALS_CHANNELS)
     except Exception as exc:
         log.exception('vocals normalize failed')
         emit_error(rid, 'internal',
